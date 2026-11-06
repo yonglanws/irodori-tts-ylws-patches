@@ -9,7 +9,7 @@
 ├── Irodori-TTS/                 # 上游库（git, Aratako/Irodori-TTS）
 ├── Irodori-TTS-Server/          # OpenAI 兼容服务（git, Aratako/Irodori-TTS-Server）
 │   ├── .venv/                   # uv 建的 venv（11GB）
-│   ├── .env                     # 本地配置（本地模型 / bf16 / 8088）
+│   ├── .env                     # 本地配置（本地模型 / fp16 / 8088）
 │   ├── pyproject.toml.orig      # 原始索引配置备份
 │   └── uv.lock.orig             # 原始锁文件备份（含官方 pytorch URL）
 ├── models/

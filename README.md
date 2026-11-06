@@ -36,8 +36,8 @@
 数值检查：全部样本 **NaN=0 / Inf=0**，峰值 0.71–0.90（无削波），
 rms 与 bf16 差异 < 0.5%（如 0.1703 vs 0.1708）。
 
-> 结论：fp16 在这张卡上可用且明显更快。但**音色/音质仍需人耳 AB**——
-> 数值稳定不等于听感一致。切换只需改 `.env` 的 `IRODORI_MODEL_PRECISION`。
+> 结论：fp16 在这张卡上可用且明显更快。2026-11-06 起本机生产已切换为 fp16。
+> 切换只需改 `.env` 的 `IRODORI_MODEL_PRECISION`；回退同理。
 
 ## 用法
 
@@ -71,7 +71,7 @@ python scripts/bench_precision.py --precisions fp16,bf16 --steps 40,24
 | `IRODORI_LORA_CACHE_SIZE` | 8 | 常驻 adapter 上限，0 = 不限制（退回上游行为）。每个约 257 MiB |
 | `IRODORI_CHUNK_PAUSE_MS` | 450 | 分块边界（。！？）补回的静音 |
 | `IRODORI_CHUNK_PAUSE_COMMA_MS` | 180 | 分块边界（、，）补回的静音 |
-| `IRODORI_MODEL_PRECISION` | `bf16` | 可设 `fp16`（见上方实测） |
+| `IRODORI_MODEL_PRECISION` | `fp16` | 本机生产已切 fp16；回退改 `bf16` |
 
 ## 注意
 
