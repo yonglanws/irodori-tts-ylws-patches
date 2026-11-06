@@ -1,0 +1,94 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 1eea134..e91de66 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@ requires-python = ">=3.10"
+ dependencies = [
+     "fastapi>=0.115.0",
+     "huggingface-hub>=0.34.0",
+-    "irodori-tts @ git+https://github.com/Aratako/Irodori-TTS.git",
++    "irodori-tts",
+     "pydantic-settings>=2.6.0",
+     "python-dotenv>=1.0.1",
+     "python-multipart>=0.0.9",
+@@ -55,6 +55,7 @@ conflicts = [
+ ]
+ 
+ [tool.uv.sources]
++irodori-tts = { path = "../Irodori-TTS", editable = true }
+ torch = [
+     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+     { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+@@ -74,12 +75,12 @@ triton-rocm = [
+ 
+ [[tool.uv.index]]
+ name = "pytorch-cpu"
+-url = "https://download.pytorch.org/whl/cpu"
++url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cpu"
+ explicit = true
+ 
+ [[tool.uv.index]]
+ name = "pytorch-cu128"
+-url = "https://download.pytorch.org/whl/cu128"
++url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128"
+ explicit = true
+ 
+ [[tool.uv.index]]
+diff --git a/src/irodori_openai_tts/app.py b/src/irodori_openai_tts/app.py
+index f1488c1..9405aae 100644
+--- a/src/irodori_openai_tts/app.py
++++ b/src/irodori_openai_tts/app.py
+@@ -4,6 +4,7 @@ import asyncio
+ import base64
+ import json
+ import logging
++import os
+ import threading
+ import time
+ from collections.abc import AsyncIterator, Mapping
+@@ -384,7 +385,12 @@ async def create_speech(payload: SpeechRequest) -> Response:
+         "X-Irodori-Total-To-Decode": f"{result.total_to_decode:.6f}",
+     }
+     if result.messages:
+-        headers["X-Irodori-Messages"] = " | ".join(result.messages)[0:4096]
++        _messages = " | ".join(result.messages)[0:4096]
++        # HTTP headers are latin-1 only; escape non-ASCII (e.g. Chinese paths)
++        # instead of failing the whole request with UnicodeEncodeError.
++        headers["X-Irodori-Messages"] = _messages.encode(
++            "latin-1", "backslashreplace"
++        ).decode("latin-1")
+ 
+     return Response(
+         content=audio_bytes,
+@@ -672,7 +678,30 @@ async def _synthesize_chunks(
+     if any(result.sample_rate != sample_rate for result in results):
+         raise RuntimeError("Chunk sample rates did not match.")
+ 
+-    audio = torch.cat([_audio_as_channels_first(result.audio) for result in results], dim=-1)
++    # --- local patch: restore the sentence pause lost at chunk boundaries ---
++    # Upstream concatenates chunks with torch.cat, so the pause after 。/！/？ is
++    # never spoken: a boundary keeps only the model's own trailing silence
++    # (~100-150 ms, vs 240-620 ms for the same break inside one chunk).
++    try:
++        pause_ms = int(os.environ.get("IRODORI_CHUNK_PAUSE_MS", "450"))
++        comma_pause_ms = int(os.environ.get("IRODORI_CHUNK_PAUSE_COMMA_MS", "180"))
++    except ValueError:
++        pause_ms, comma_pause_ms = 450, 180
++
++    audio_parts: list[torch.Tensor] = []
++    for index, result in enumerate(results):
++        part = _audio_as_channels_first(result.audio)
++        if index > 0 and pause_ms > 0:
++            prev_text = chunks[index - 1].rstrip()
++            last_char = prev_text[-1] if prev_text else ""
++            extra_ms = comma_pause_ms if last_char in "、，," else pause_ms
++            pad = int(sample_rate * extra_ms / 1000) if extra_ms > 0 else 0
++            if pad > 0:
++                audio_parts.append(
++                    torch.zeros((part.shape[0], pad), dtype=part.dtype, device=part.device)
++                )
++        audio_parts.append(part)
++    audio = torch.cat(audio_parts, dim=-1)
+     messages = [message for result in results for message in result.messages]
+     stage_timings = [
+         (f"chunk_{index}:{name}", seconds)

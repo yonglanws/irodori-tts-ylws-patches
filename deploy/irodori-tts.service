@@ -1,0 +1,23 @@
+[Unit]
+Description=Irodori-TTS OpenAI-compatible API server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/vol2
+
+[Service]
+Type=simple
+User=ylws
+Group=Users
+WorkingDirectory=/vol2/1000/Irodori-TTS/Irodori-TTS-Server
+EnvironmentFile=/vol2/1000/Irodori-TTS/Irodori-TTS-Server/.env
+Environment=IRODORI_SDPA_CUDNN=0
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ExecStart=/vol2/1000/Irodori-TTS/Irodori-TTS-Server/.venv/bin/python -m irodori_openai_tts --host 0.0.0.0 --port 8088
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

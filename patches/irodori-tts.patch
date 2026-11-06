@@ -1,0 +1,74 @@
+diff --git a/irodori_tts/inference_runtime.py b/irodori_tts/inference_runtime.py
+index 3c1bdd2..c87dfbc 100644
+--- a/irodori_tts/inference_runtime.py
++++ b/irodori_tts/inference_runtime.py
+@@ -4,6 +4,7 @@ import gc
+ import hashlib
+ import json
+ import math
++import os
+ import secrets
+ import threading
+ import time
+@@ -396,7 +397,15 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
+         if device.type not in ("cuda", "xpu"):
+             raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
+         return torch.bfloat16
+-    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
++    # local patch: allow fp16 (Turing/sm_75 has real fp16 tensor cores; bf16 is
++    # emulated there). Verified on CMP 40HX: no NaN/Inf, rms matches bf16.
++    if mode in ("fp16", "float16", "half"):
++        if device.type not in ("cuda", "xpu"):
++            raise ValueError("precision='fp16' currently requires CUDA or XPU device.")
++        return torch.float16
++    raise ValueError(
++        f"Unsupported precision={precision!r}. Expected one of: fp32, bf16, fp16."
++    )
+ 
+ 
+ def resolve_cfg_scales(
+@@ -895,8 +904,35 @@ class InferenceRuntime:
+         if self.key.compile_model:
+             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+ 
++        # --- local patch: LRU eviction of resident LoRA adapters ---
++        # Upstream never releases an adapter once loaded, so VRAM grows with the
++        # number of distinct personas served. Keep at most IRODORI_LORA_CACHE_SIZE
++        # resident (0 disables the limit) and evict the least recently used first.
++        lru = getattr(self, "_lora_lru", None)
++        if lru is None:
++            lru = self._lora_lru = OrderedDict()
++        try:
++            capacity = int(os.environ.get("IRODORI_LORA_CACHE_SIZE", "8"))
++        except ValueError:
++            capacity = 8
++
+         adapter_name = self._lora_adapter_names.get(resolved_path)
+         if adapter_name is None:
++            if capacity > 0:
++                while len(lru) >= capacity:
++                    old_path, _stamp = lru.popitem(last=False)
++                    old_name = self._lora_adapter_names.pop(old_path, None)
++                    if old_name is None:
++                        continue
++                    try:
++                        self.model.delete_adapter(old_name)
++                        msg = f"info: evicted LoRA adapter (LRU): {old_path}"
++                    except Exception as exc:  # noqa: BLE001
++                        msg = f"warn: failed to evict LoRA adapter {old_name}: {exc}"
++                    messages.append(msg)
++                    log_fn(msg)
++                    if str(self.model_device).startswith("cuda"):
++                        torch.cuda.empty_cache()
+             adapter_name = self._adapter_name_for_path(resolved_path)
+             msg = f"info: loading LoRA adapter: {resolved_path}"
+             messages.append(msg)
+@@ -914,6 +950,8 @@ class InferenceRuntime:
+             torch_device=str(self.model_device),
+         )
+         self._lora_adapter_names[resolved_path] = adapter_name
++        lru[resolved_path] = time.monotonic()
++        lru.move_to_end(resolved_path)
+         self.model = _move_inference_module(
+             self.model,
+             device=self.model_device,

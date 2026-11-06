@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.bak
+*.bak_*
+*.orig
+*.orig_*
+.DS_Store
