@@ -3,7 +3,7 @@
 在 **NVIDIA CMP 40HX 8GB（Turing / sm_75）**、Debian 12 的家用服务器上部署
 [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) v4.1-Small +
 [Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server) 时，踩到的
-4 个上游问题，以及对应的最小补丁、部署文件和精度基准脚本。
+4 个上游问题，以及对应的最小补丁、部署文件和精度基准脚本
 
 上游基线：
 
