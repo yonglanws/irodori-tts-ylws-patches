@@ -1,5 +1,5 @@
 diff --git a/irodori_tts/inference_runtime.py b/irodori_tts/inference_runtime.py
-index 3c1bdd2..c87dfbc 100644
+index 3c1bdd2..3dd72cd 100644
 --- a/irodori_tts/inference_runtime.py
 +++ b/irodori_tts/inference_runtime.py
 @@ -4,6 +4,7 @@ import gc
@@ -10,7 +10,96 @@ index 3c1bdd2..c87dfbc 100644
  import secrets
  import threading
  import time
-@@ -396,7 +397,15 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
+@@ -105,7 +106,9 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
+ 
+ def _sync_device(device: torch.device) -> None:
+     if device.type == "cuda":
+-        torch.cuda.synchronize(device)
++        # Sync only this thread's stream: a device-wide synchronize would wait
++        # for the other runtime's kernels and serialize concurrent personas.
++        torch.cuda.current_stream(device).synchronize()
+     elif device.type == "mps":
+         mps = getattr(torch, "mps", None)
+         if mps is not None and hasattr(mps, "synchronize"):
+@@ -126,6 +129,77 @@ def _sync_devices(*devices: torch.device) -> None:
+         seen.add(key)
+ 
+ 
++class _LazyContext:
++    """Defer a context-manager factory until __enter__ runs.
++
++    ``with (guard, self._prepare_lora_for_request(...))`` calls the adapter
++    preparation while evaluating the with-items, i.e. *before* the guard is
++    entered. Deferring it keeps the adapter switch inside the per-runtime
++    guard so a concurrent request cannot switch the adapter under it.
++    """
++
++    def __init__(self, factory: Any) -> None:
++        self._factory = factory
++        self._ctx: Any = None
++
++    def __enter__(self) -> Any:
++        self._ctx = self._factory()
++        return self._ctx.__enter__()
++
++    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
++        if self._ctx is None:
++            return False
++        return self._ctx.__exit__(exc_type, exc, tb)
++
++
++_LORA_LOAD_LOCK = threading.Lock()
++
++
++class _InferenceGuard:
++    """Per-runtime inference mutex plus a dedicated CUDA stream.
++
++    Two InferenceRuntime instances in one process would otherwise share the
++    legacy default CUDA stream, which serializes their kernels. Giving each
++    runtime its own stream lets two personas generate at the same time; the
++    lock still keeps a single runtime's own requests serialized (its LoRA
++    adapter state is global).
++    """
++
++    def __init__(self, device: torch.device) -> None:
++        self._lock = threading.Lock()
++        self._stream: torch.cuda.Stream | None = None
++        if device.type == "cuda":
++            self._stream = torch.cuda.Stream(device=device)
++        self._stream_ctx: Any = None
++
++    @property
++    def busy(self) -> bool:
++        return self._lock.locked()
++
++    def __enter__(self) -> "_InferenceGuard":
++        self._lock.acquire()
++        try:
++            if self._stream is not None:
++                self._stream_ctx = torch.cuda.stream(self._stream)
++                self._stream_ctx.__enter__()
++        except BaseException:
++            self._lock.release()
++            raise
++        return self
++
++    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
++        try:
++            if self._stream is not None and self._stream_ctx is not None:
++                # Finish this request before the caller (default stream)
++                # concatenates and encodes the audio tensors.
++                self._stream.synchronize()
++                self._stream_ctx.__exit__(exc_type, exc, tb)
++                self._stream_ctx = None
++        finally:
++            self._lock.release()
++        return False
++
++
+ def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
+     _sync_devices(device, *extra_devices)
+     return time.perf_counter()
+@@ -396,7 +470,15 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
          if device.type not in ("cuda", "xpu"):
              raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
          return torch.bfloat16
@@ -27,7 +116,53 @@ index 3c1bdd2..c87dfbc 100644
  
  
  def resolve_cfg_scales(
-@@ -895,8 +904,35 @@ class InferenceRuntime:
+@@ -704,7 +786,7 @@ class InferenceRuntime:
+         self.default_caption_max_len = default_caption_max_len
+         self.default_max_ref_seconds = float(default_max_ref_seconds)
+         self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
+-        self._infer_lock = threading.Lock()
++        self._infer_ctx = _InferenceGuard(self.model_device)
+         self._model_dtype = next(self.model.parameters()).dtype
+         self._lora_adapter_names: dict[str, str] = {}
+         self._reference_latents: OrderedDict[tuple, tuple[torch.Tensor, list[str]]] = OrderedDict()
+@@ -861,19 +943,23 @@ class InferenceRuntime:
+         stage_timings: list[tuple[str, float]],
+         log_fn: Callable[[str], None],
+     ) -> Any:
+-        should_time = adapter_path is not None and str(adapter_path).strip() != ""
+-        t0 = _measure_start(self.model_device) if should_time else None
+-        try:
+-            return self._prepare_lora_for_request_inner(
+-                adapter_path,
+-                messages=messages,
+-                log_fn=log_fn,
+-            )
+-        finally:
+-            if t0 is not None:
+-                stage_sec = _measure_end(self.model_device, t0)
+-                stage_timings.append(("prepare_lora", stage_sec))
+-                log_fn(f"[runtime] prepare_lora: {stage_sec * 1000.0:.1f} ms")
++        def _run() -> Any:
++            should_time = adapter_path is not None and str(adapter_path).strip() != ""
++            t0 = _measure_start(self.model_device) if should_time else None
++            try:
++                with _LORA_LOAD_LOCK:
++                    return self._prepare_lora_for_request_inner(
++                        adapter_path,
++                        messages=messages,
++                        log_fn=log_fn,
++                    )
++            finally:
++                if t0 is not None:
++                    stage_sec = _measure_end(self.model_device, t0)
++                    stage_timings.append(("prepare_lora", stage_sec))
++                    log_fn(f"[runtime] prepare_lora: {stage_sec * 1000.0:.1f} ms")
++
++        return _LazyContext(_run)
+ 
+     def _prepare_lora_for_request_inner(
+         self,
+@@ -895,8 +981,35 @@ class InferenceRuntime:
          if self.key.compile_model:
              raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
  
@@ -63,7 +198,7 @@ index 3c1bdd2..c87dfbc 100644
              adapter_name = self._adapter_name_for_path(resolved_path)
              msg = f"info: loading LoRA adapter: {resolved_path}"
              messages.append(msg)
-@@ -914,6 +950,8 @@ class InferenceRuntime:
+@@ -914,6 +1027,8 @@ class InferenceRuntime:
              torch_device=str(self.model_device),
          )
          self._lora_adapter_names[resolved_path] = adapter_name
@@ -72,3 +207,12 @@ index 3c1bdd2..c87dfbc 100644
          self.model = _move_inference_module(
              self.model,
              device=self.model_device,
+@@ -1178,7 +1293,7 @@ class InferenceRuntime:
+         lora_timings: list[tuple[str, float]] = []
+ 
+         with (
+-            self._infer_lock,
++            self._infer_ctx,
+             self._prepare_lora_for_request(
+                 requests[0].lora_adapter,
+                 messages=lora_messages,

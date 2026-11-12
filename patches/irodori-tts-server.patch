@@ -35,7 +35,7 @@ index 1eea134..e91de66 100644
  
  [[tool.uv.index]]
 diff --git a/src/irodori_openai_tts/app.py b/src/irodori_openai_tts/app.py
-index f1488c1..9405aae 100644
+index f1488c1..f305f21 100644
 --- a/src/irodori_openai_tts/app.py
 +++ b/src/irodori_openai_tts/app.py
 @@ -4,6 +4,7 @@ import asyncio
@@ -92,3 +92,180 @@ index f1488c1..9405aae 100644
      messages = [message for result in results for message in result.messages]
      stage_timings = [
          (f"chunk_{index}:{name}", seconds)
+@@ -917,9 +946,11 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
+             _coalesce(opts.max_caption_len, _extra(payload, "max_caption_len"), None),
+             "max_caption_len",
+         ),
+-        num_steps=_as_optional_int(
+-            _coalesce(opts.num_steps, _extra(payload, "num_steps"), settings.default_num_steps),
+-            "num_steps",
++        num_steps=_clamp_num_steps(
++            _as_optional_int(
++                _coalesce(opts.num_steps, _extra(payload, "num_steps"), settings.default_num_steps),
++                "num_steps",
++            )
+         ),
+         cfg_scale_text=_as_float(
+             _coalesce(
+@@ -1121,6 +1152,13 @@ def _as_optional_int(value: Any, name: str) -> int | None:
+     return _as_int(value, name)
+ 
+ 
++def _clamp_num_steps(value: int | None) -> int | None:
++    limit = int(settings.max_num_steps)
++    if value is not None and limit > 0:
++        return min(value, limit)
++    return value
++
++
+ def _as_optional_str(value: Any, name: str) -> str | None:
+     if value is None:
+         return None
+diff --git a/src/irodori_openai_tts/config.py b/src/irodori_openai_tts/config.py
+index 57b255f..a6a9e7e 100644
+--- a/src/irodori_openai_tts/config.py
++++ b/src/irodori_openai_tts/config.py
+@@ -35,6 +35,8 @@ class Settings(BaseSettings):
+     preload: bool = False
+     model_load_timeout: float = 300.0
+     max_concurrent_synthesis: int = 1
++    runtime_pool_size: int = 1
++    max_num_steps: int = 0
+     synthesis_wait_timeout: float = 300.0
+     empty_cache_interval: int = 10
+ 
+diff --git a/src/irodori_openai_tts/runtime.py b/src/irodori_openai_tts/runtime.py
+index 9ef09b2..54f2bc2 100644
+--- a/src/irodori_openai_tts/runtime.py
++++ b/src/irodori_openai_tts/runtime.py
+@@ -23,16 +23,38 @@ class RuntimeLoadTimeoutError(RuntimeError):
+     pass
+ 
+ 
++def _share_parameters(dst: torch.nn.Module, src: torch.nn.Module, label: str) -> None:
++    """Point ``dst`` parameters at ``src`` storages.
++
++    A second InferenceRuntime needs its own module tree (separate PEFT adapter
++    state and inference guard) but not a second copy of the base weights.
++    Sharing the storages keeps the extra runtime at roughly 0.1 GiB.
++    """
++    src_params = dict(src.named_parameters())
++    shared = 0
++    skipped = 0
++    for name, param in dst.named_parameters():
++        other = src_params.get(name)
++        if other is None or other.shape != param.shape:
++            skipped += 1
++            continue
++        param.data = other.data
++        shared += 1
++    logger.info("shared %s parameters: shared=%d skipped=%d", label, shared, skipped)
++
++
+ class RuntimeManager:
+     def __init__(self, settings: Settings) -> None:
+         self.settings = settings
+         self._lock = threading.Lock()
+-        self._runtime: InferenceRuntime | None = None
++        self._pool_lock = threading.Lock()
++        self._pool: list[InferenceRuntime] = []
++        self._next = 0
+         self._checkpoint_path: str | None = None
+ 
+     def get(self) -> InferenceRuntime:
+-        if self._runtime is not None:
+-            return self._runtime
++        if self._pool:
++            return self._pick()
+ 
+         timeout = float(self.settings.model_load_timeout)
+         acquired = self._lock.acquire(timeout=max(timeout, 0.0))
+@@ -42,44 +64,68 @@ class RuntimeManager:
+             )
+ 
+         try:
+-            if self._runtime is None:
++            if not self._pool:
+                 logger.info("loading runtime")
+                 t0 = time.perf_counter()
+                 self._checkpoint_path = self._resolve_checkpoint_path()
+                 logger.info("checkpoint resolved: %s", self._checkpoint_path)
+-                runtime = InferenceRuntime.from_key(
+-                    RuntimeKey(
+-                        checkpoint=self._checkpoint_path,
+-                        model_device=self._resolve_device(self.settings.model_device),
+-                        codec_repo=str(self.settings.codec_repo),
+-                        model_precision=str(self.settings.model_precision),
+-                        codec_device=self._resolve_device(self.settings.codec_device),
+-                        codec_precision=str(self.settings.codec_precision),
+-                        codec_deterministic_encode=bool(self.settings.codec_deterministic_encode),
+-                        codec_deterministic_decode=bool(self.settings.codec_deterministic_decode),
+-                        compile_model=bool(self.settings.compile_model),
+-                        compile_dynamic=bool(self.settings.compile_dynamic),
+-                    )
++                key = RuntimeKey(
++                    checkpoint=self._checkpoint_path,
++                    model_device=self._resolve_device(self.settings.model_device),
++                    codec_repo=str(self.settings.codec_repo),
++                    model_precision=str(self.settings.model_precision),
++                    codec_device=self._resolve_device(self.settings.codec_device),
++                    codec_precision=str(self.settings.codec_precision),
++                    codec_deterministic_encode=bool(self.settings.codec_deterministic_encode),
++                    codec_deterministic_decode=bool(self.settings.codec_deterministic_decode),
++                    compile_model=bool(self.settings.compile_model),
++                    compile_dynamic=bool(self.settings.compile_dynamic),
+                 )
+-                _release_cuda_load_cache(runtime)
+-                self._runtime = runtime
++                pool_size = max(1, int(self.settings.runtime_pool_size))
++                logger.info("runtime pool size: %d", pool_size)
++
++                primary = InferenceRuntime.from_key(key)
++                _release_cuda_load_cache(primary)
++                pool = [primary]
++                for index in range(1, pool_size):
++                    extra = InferenceRuntime.from_key(key)
++                    _share_parameters(extra.model, primary.model, f"pool[{index}].model")
++                    _share_parameters(extra.codec.model, primary.codec.model, f"pool[{index}].codec")
++                    torch.cuda.empty_cache()
++                    pool.append(extra)
++                    logger.info("runtime pool[%d] ready", index)
++
++                with self._pool_lock:
++                    self._pool = pool
++                    self._next = 0
+                 elapsed = time.perf_counter() - t0
+-                logger.info("runtime loaded in %.2fs", elapsed)
+-            return self._runtime
++                logger.info("runtime pool loaded in %.2fs (size=%d)", elapsed, len(pool))
++            return self._pick()
+         finally:
+             self._lock.release()
+ 
++    def _pick(self) -> InferenceRuntime:
++        with self._pool_lock:
++            start = self._next
++            self._next += 1
++            pool = self._pool
++        for offset in range(len(pool)):
++            runtime = pool[(start + offset) % len(pool)]
++            if not runtime._infer_ctx.busy:
++                return runtime
++        return pool[start % len(pool)]
++
+     @property
+     def checkpoint_path(self) -> str | None:
+         return self._checkpoint_path
+ 
+     @property
+     def is_loaded(self) -> bool:
+-        return self._runtime is not None
++        return bool(self._pool)
+ 
+     @property
+     def is_loading(self) -> bool:
+-        return self._runtime is None and self._lock.locked()
++        return not self._pool and self._lock.locked()
+ 
+     def _resolve_checkpoint_path(self) -> str:
+         if self.settings.checkpoint is not None and str(self.settings.checkpoint).strip() != "":
